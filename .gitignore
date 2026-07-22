@@ -1,5 +1,6 @@
 .env
 .spotify-token.json
+data/raw/
 __pycache__/
 *.pyc
 .venv/
