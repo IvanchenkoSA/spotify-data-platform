@@ -62,6 +62,12 @@ ANALYTICS_TIMEZONE=Asia/Novosibirsk
    py -3.13 -B -m ingestion.src.transform
    ```
 
+5. Enrich cached artists with MusicBrainz genres.
+
+   ```powershell
+   py -3.13 -B -m ingestion.src.enrich_artists
+   ```
+
 ## What happens on each ingestion run
 
 1. Read the watermark from PostgreSQL.
@@ -110,7 +116,7 @@ docker compose exec postgres psql -U spotify -d spotify -c "SELECT track_name, a
 
 ## Analytics views
 
-The database also provides four SQL views. They always use the current contents of `mart_listening_history`, so no separate refresh is required.
+The database also provides SQL views. They always use the current contents of `mart_listening_history`, so no separate refresh is required.
 
 | View | Purpose |
 | --- | --- |
@@ -118,6 +124,7 @@ The database also provides four SQL views. They always use the current contents 
 | `analytics_top_artists` | Play count and number of distinct tracks for each artist |
 | `analytics_listening_by_day` | Listening activity by local calendar day |
 | `analytics_listening_by_hour` | Listening activity by local hour of day |
+| `analytics_top_genres` | Play count by genres attached to track artists |
 
 Examples:
 
@@ -127,6 +134,20 @@ docker compose exec postgres psql -U spotify -d spotify -c "SELECT track_name, a
 docker compose exec postgres psql -U spotify -d spotify -c "SELECT artist_name, play_count, unique_tracks FROM analytics_top_artists ORDER BY play_count DESC, artist_name LIMIT 20;"
 
 docker compose exec postgres psql -U spotify -d spotify -c "SELECT * FROM analytics_listening_by_hour ORDER BY hour_local;"
+```
+
+## Artist and genre enrichment
+
+Spotify's recently-played response includes artist IDs but not track genres. The enrichment command uses the public MusicBrainz API to match only uncached artists by exact name, then stores the MusicBrainz ID in `dim_artists` and its zero-or-more genres in `artist_genres`. MusicBrainz does not require an API key; the command deliberately sends one request at a time to respect its public API rate limit.
+
+An exact-name match is deliberately conservative: an artist who cannot be identified unambiguously remains without genres rather than receiving tags from a namesake. Run the command again only after adding new listening data; artists already looked up are cached.
+
+Genres belong to artists, not individual tracks. A collaboration can therefore contribute to multiple genres; `analytics_top_genres` counts a play once per distinct genre associated with any artist on that track.
+
+Run enrichment after ingestion and transform:
+
+```powershell
+py -3.13 -B -m ingestion.src.enrich_artists
 ```
 
 Stop the local database when it is not needed:
@@ -139,7 +160,7 @@ The default database credentials are for local development only. Do not use them
 
 ## Dashboard
 
-The Streamlit dashboard visualizes the analytics views: listening activity by local day and hour, top tracks, top artists, and the latest listening events.
+The Streamlit dashboard visualizes the analytics views: listening activity by local day and hour, top tracks, top artists, top genres, and the latest listening events.
 
 Start the database and make sure the mart is current:
 
@@ -147,6 +168,7 @@ Start the database and make sure the mart is current:
 docker compose up -d
 py -3.13 -B -m ingestion.src.main
 py -3.13 -B -m ingestion.src.transform
+py -3.13 -B -m ingestion.src.enrich_artists
 ```
 
 Then run the dashboard:

@@ -49,10 +49,32 @@ CREATE TABLE IF NOT EXISTS mart_listening_history (
 CREATE INDEX IF NOT EXISTS mart_listening_history_track_id_idx
     ON mart_listening_history (track_id);
 
+CREATE TABLE IF NOT EXISTS dim_artists (
+    artist_id TEXT PRIMARY KEY,
+    artist_name TEXT NOT NULL,
+    spotify_url TEXT,
+    popularity SMALLINT,
+    genres_fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE dim_artists
+    ADD COLUMN IF NOT EXISTS musicbrainz_id UUID,
+    ADD COLUMN IF NOT EXISTS musicbrainz_fetched_at TIMESTAMPTZ;
+
+CREATE TABLE IF NOT EXISTS artist_genres (
+    artist_id TEXT NOT NULL REFERENCES dim_artists (artist_id) ON DELETE CASCADE,
+    genre TEXT NOT NULL,
+    PRIMARY KEY (artist_id, genre)
+);
+
+CREATE INDEX IF NOT EXISTS artist_genres_genre_idx
+    ON artist_genres (genre);
+
 DROP VIEW IF EXISTS analytics_top_tracks;
 DROP VIEW IF EXISTS analytics_top_artists;
 DROP VIEW IF EXISTS analytics_listening_by_day;
 DROP VIEW IF EXISTS analytics_listening_by_hour;
+DROP VIEW IF EXISTS analytics_top_genres;
 
 CREATE OR REPLACE VIEW analytics_top_tracks AS
 SELECT
@@ -104,6 +126,22 @@ CROSS JOIN (
     WHERE setting_name = 'analytics_timezone'
 ) AS settings
 GROUP BY settings.setting_value, EXTRACT(HOUR FROM played_at AT TIME ZONE settings.setting_value);
+
+CREATE OR REPLACE VIEW analytics_top_genres AS
+WITH listening_genres AS (
+    SELECT DISTINCT
+        listening.played_at,
+        genre.genre
+    FROM raw_recently_played AS raw
+    JOIN mart_listening_history AS listening ON listening.played_at = raw.played_at
+    CROSS JOIN LATERAL jsonb_array_elements(raw.payload->'track'->'artists') AS track_artist
+    JOIN artist_genres AS genre ON genre.artist_id = track_artist->>'id'
+)
+SELECT
+    genre,
+    COUNT(*) AS play_count
+FROM listening_genres
+GROUP BY genre;
 """
 
 
@@ -229,6 +267,59 @@ def transform_listening_history(connection: psycopg.Connection) -> int:
 
     connection.commit()
     return inserted_count
+
+
+def get_unenriched_artists(connection: psycopg.Connection) -> list[tuple[str, str]]:
+    """Return artists whose MusicBrainz genre lookup has not yet run."""
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT DISTINCT
+                artist->>'id' AS artist_id,
+                artist->>'name' AS artist_name
+            FROM raw_recently_played AS raw
+            CROSS JOIN LATERAL jsonb_array_elements(raw.payload->'track'->'artists') AS artist
+            LEFT JOIN dim_artists AS cached ON cached.artist_id = artist->>'id'
+            WHERE artist->>'id' IS NOT NULL
+              AND (cached.artist_id IS NULL OR cached.musicbrainz_fetched_at IS NULL)
+            ORDER BY artist->>'id'
+            """
+        )
+        return list(cursor.fetchall())
+
+
+def cache_musicbrainz_genres(connection: psycopg.Connection, artists: list[dict]) -> tuple[int, int]:
+    """Store the MusicBrainz match status and replace its artist genres."""
+    genre_count = 0
+    with connection.cursor() as cursor:
+        for artist in artists:
+            cursor.execute(
+                """
+                INSERT INTO dim_artists (artist_id, artist_name, musicbrainz_id, musicbrainz_fetched_at)
+                VALUES (%s, %s, %s, NOW())
+                ON CONFLICT (artist_id) DO UPDATE
+                SET musicbrainz_id = EXCLUDED.musicbrainz_id,
+                    musicbrainz_fetched_at = NOW()
+                """,
+                (
+                    artist["id"],
+                    artist["name"],
+                    artist.get("musicbrainz_id"),
+                ),
+            )
+            cursor.execute("DELETE FROM artist_genres WHERE artist_id = %s", (artist["id"],))
+            cursor.executemany(
+                """
+                INSERT INTO artist_genres (artist_id, genre)
+                VALUES (%s, %s)
+                ON CONFLICT DO NOTHING
+                """,
+                [(artist["id"], genre) for genre in artist["genres"]],
+            )
+            genre_count += len(artist["genres"])
+
+    connection.commit()
+    return len(artists), genre_count
 
 
 def connect() -> psycopg.Connection:

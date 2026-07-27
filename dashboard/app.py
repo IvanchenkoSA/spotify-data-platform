@@ -68,6 +68,14 @@ def main() -> None:
             LIMIT 10
             """
         )
+        top_genres = query_dataframe(
+            """
+            SELECT genre, play_count
+            FROM analytics_top_genres
+            ORDER BY play_count DESC, genre
+            LIMIT 10
+            """
+        )
         recent = query_dataframe(
             """
             SELECT
@@ -116,6 +124,12 @@ def main() -> None:
 
     st.subheader("Последние прослушивания")
     st.dataframe(recent, hide_index=True, use_container_width=True)
+
+    st.subheader("Top genres (from artist metadata)")
+    if top_genres.empty:
+        st.info("Run artist enrichment to populate genre analytics.")
+    else:
+        st.bar_chart(top_genres, x="genre", y="play_count", horizontal=True)
 
 
 if __name__ == "__main__":
