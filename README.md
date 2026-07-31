@@ -26,6 +26,7 @@ Create a local `.env` file in the repository root. It is ignored by Git.
 SPOTIFY_CLIENT_ID=your_client_id
 SPOTIFY_CLIENT_SECRET=your_client_secret
 SPOTIFY_REDIRECT_URI=http://127.0.0.1:8888/callback
+LASTFM_API_KEY=your_lastfm_api_key
 ```
 
 Optionally set the analytics timezone explicitly. If it is omitted, the transform command uses the timezone configured on the machine where it runs.
@@ -62,7 +63,7 @@ ANALYTICS_TIMEZONE=Asia/Novosibirsk
    py -3.13 -B -m ingestion.src.transform
    ```
 
-5. Enrich cached artists with MusicBrainz genres.
+5. Enrich cached artists with Last.fm genre tags.
 
    ```powershell
    py -3.13 -B -m ingestion.src.enrich_artists
@@ -124,7 +125,7 @@ The database also provides SQL views. They always use the current contents of `m
 | `analytics_top_artists` | Play count and number of distinct tracks for each artist |
 | `analytics_listening_by_day` | Listening activity by local calendar day |
 | `analytics_listening_by_hour` | Listening activity by local hour of day |
-| `analytics_top_genres` | Play count by genres attached to track artists |
+| `analytics_top_genres` | Play count by Last.fm tags attached to track artists |
 
 Examples:
 
@@ -138,11 +139,11 @@ docker compose exec postgres psql -U spotify -d spotify -c "SELECT * FROM analyt
 
 ## Artist and genre enrichment
 
-Spotify's recently-played response includes artist IDs but not track genres. The enrichment command uses the public MusicBrainz API to match only uncached artists by exact name, then stores the MusicBrainz ID in `dim_artists` and its zero-or-more genres in `artist_genres`. MusicBrainz does not require an API key; the command deliberately sends one request at a time to respect its public API rate limit.
+Spotify's recently-played response includes artist IDs but not track genres. The enrichment command calls Last.fm's `artist.getInfo` endpoint and stores its zero-or-more public tags in `artist_genres`. `LASTFM_API_KEY` is required in `.env` and is kept local.
 
-An exact-name match is deliberately conservative: an artist who cannot be identified unambiguously remains without genres rather than receiving tags from a namesake. Run the command again only after adding new listening data; artists already looked up are cached.
+The returned artist name must exactly match the Spotify artist name, which avoids assigning tags from a namesake. Run the command again only after adding new listening data; artists already looked up are cached.
 
-Genres belong to artists, not individual tracks. A collaboration can therefore contribute to multiple genres; `analytics_top_genres` counts a play once per distinct genre associated with any artist on that track.
+Tags belong to artists, not individual tracks. A collaboration can therefore contribute to multiple tags; `analytics_top_genres` counts a play once per distinct tag associated with any artist on that track.
 
 Run enrichment after ingestion and transform:
 

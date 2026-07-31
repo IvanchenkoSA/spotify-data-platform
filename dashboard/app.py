@@ -206,7 +206,7 @@ def main() -> None:
     st.subheader("Последние прослушивания")
     st.dataframe(recent, hide_index=True, use_container_width=True)
 
-    st.subheader("Top genres (from artist metadata)")
+    st.subheader("Топ жанровых тегов (Last.fm)")
     if top_genres.empty:
         st.info("Run artist enrichment to populate genre analytics.")
     else:

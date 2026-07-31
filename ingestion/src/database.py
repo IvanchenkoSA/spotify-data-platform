@@ -59,7 +59,8 @@ CREATE TABLE IF NOT EXISTS dim_artists (
 
 ALTER TABLE dim_artists
     ADD COLUMN IF NOT EXISTS musicbrainz_id UUID,
-    ADD COLUMN IF NOT EXISTS musicbrainz_fetched_at TIMESTAMPTZ;
+    ADD COLUMN IF NOT EXISTS musicbrainz_fetched_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS lastfm_fetched_at TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS artist_genres (
     artist_id TEXT NOT NULL REFERENCES dim_artists (artist_id) ON DELETE CASCADE,
@@ -270,7 +271,7 @@ def transform_listening_history(connection: psycopg.Connection) -> int:
 
 
 def get_unenriched_artists(connection: psycopg.Connection) -> list[tuple[str, str]]:
-    """Return artists whose MusicBrainz genre lookup has not yet run."""
+    """Return artists whose Last.fm tag lookup has not yet run."""
     with connection.cursor() as cursor:
         cursor.execute(
             """
@@ -281,30 +282,30 @@ def get_unenriched_artists(connection: psycopg.Connection) -> list[tuple[str, st
             CROSS JOIN LATERAL jsonb_array_elements(raw.payload->'track'->'artists') AS artist
             LEFT JOIN dim_artists AS cached ON cached.artist_id = artist->>'id'
             WHERE artist->>'id' IS NOT NULL
-              AND (cached.artist_id IS NULL OR cached.musicbrainz_fetched_at IS NULL)
+              AND (cached.artist_id IS NULL OR cached.lastfm_fetched_at IS NULL)
             ORDER BY artist->>'id'
             """
         )
         return list(cursor.fetchall())
 
 
-def cache_musicbrainz_genres(connection: psycopg.Connection, artists: list[dict]) -> tuple[int, int]:
-    """Store the MusicBrainz match status and replace its artist genres."""
+def cache_lastfm_genres(connection: psycopg.Connection, artists: list[dict]) -> tuple[int, int]:
+    """Store the Last.fm lookup status and replace artist genre tags."""
     genre_count = 0
     with connection.cursor() as cursor:
         for artist in artists:
             cursor.execute(
                 """
-                INSERT INTO dim_artists (artist_id, artist_name, musicbrainz_id, musicbrainz_fetched_at)
-                VALUES (%s, %s, %s, NOW())
+                INSERT INTO dim_artists (artist_id, artist_name, lastfm_fetched_at)
+                VALUES (%s, %s, NOW())
                 ON CONFLICT (artist_id) DO UPDATE
-                SET musicbrainz_id = EXCLUDED.musicbrainz_id,
-                    musicbrainz_fetched_at = NOW()
+                SET artist_name = EXCLUDED.artist_name,
+                    lastfm_fetched_at = NOW(),
+                    genres_fetched_at = NOW()
                 """,
                 (
                     artist["id"],
                     artist["name"],
-                    artist.get("musicbrainz_id"),
                 ),
             )
             cursor.execute("DELETE FROM artist_genres WHERE artist_id = %s", (artist["id"],))
