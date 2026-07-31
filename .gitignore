@@ -1,4 +1,5 @@
 .env
+PROJECT_PLAN.md
 .spotify-token.json
 data/raw/
 __pycache__/
