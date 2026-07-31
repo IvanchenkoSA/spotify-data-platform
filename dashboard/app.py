@@ -11,9 +11,9 @@ st.set_page_config(page_title="Spotify listening dashboard", page_icon="🎧", l
 
 
 @st.cache_data(ttl=60)
-def query_dataframe(query: str) -> pd.DataFrame:
+def query_dataframe(query: str, params: tuple = ()) -> pd.DataFrame:
     with psycopg.connect(database_url()) as connection:
-        return pd.read_sql(query, connection)
+        return pd.read_sql(query, connection, params=params)
 
 
 def main() -> None:
@@ -24,72 +24,153 @@ def main() -> None:
         st.rerun()
 
     try:
-        summary = query_dataframe(
+        date_bounds = query_dataframe(
             """
             SELECT
-                (SELECT COUNT(*) FROM mart_listening_history) AS total_plays,
-                (SELECT COUNT(DISTINCT track_id) FROM mart_listening_history) AS unique_tracks,
-                (
-                    SELECT COUNT(DISTINCT artist_name)
-                    FROM mart_listening_history
-                    CROSS JOIN LATERAL UNNEST(artist_names) AS artist(artist_name)
-                ) AS unique_artists,
-                (SELECT MIN(played_at) FROM mart_listening_history) AS first_play,
-                (SELECT MAX(played_at) FROM mart_listening_history) AS last_play
+                MIN((listening.played_at AT TIME ZONE settings.setting_value)::DATE) AS first_play_date,
+                MAX((listening.played_at AT TIME ZONE settings.setting_value)::DATE) AS last_play_date
+            FROM mart_listening_history AS listening
+            CROSS JOIN (
+                SELECT setting_value
+                FROM pipeline_settings
+                WHERE setting_name = 'analytics_timezone'
+            ) AS settings
             """
+        )
+        if date_bounds.empty or pd.isna(date_bounds.loc[0, "first_play_date"]):
+            st.info("В аналитической таблице пока нет данных. Сначала запусти ingestion и transform.")
+            return
+
+        first_play_date = date_bounds.loc[0, "first_play_date"]
+        last_play_date = date_bounds.loc[0, "last_play_date"]
+        selected_period = st.sidebar.date_input(
+            "Период прослушиваний",
+            value=(first_play_date, last_play_date),
+            min_value=first_play_date,
+            max_value=last_play_date,
+        )
+        if not isinstance(selected_period, tuple) or len(selected_period) != 2:
+            st.sidebar.info("Выбери дату начала и дату окончания периода.")
+            return
+
+        start_date, end_date = selected_period
+        filter_params = (start_date, end_date)
+        filtered_listening = """
+            FROM mart_listening_history AS listening
+            CROSS JOIN (
+                SELECT setting_value
+                FROM pipeline_settings
+                WHERE setting_name = 'analytics_timezone'
+            ) AS settings
+            WHERE (listening.played_at AT TIME ZONE settings.setting_value)::DATE
+                BETWEEN %s AND %s
+        """
+
+        summary = query_dataframe(
+            f"""
+            SELECT
+                COUNT(DISTINCT listening.played_at) AS total_plays,
+                COUNT(DISTINCT listening.track_id) AS unique_tracks,
+                COUNT(DISTINCT artist.artist_name) AS unique_artists,
+                MIN(listening.played_at) AS first_play,
+                MAX(listening.played_at) AS last_play
+            FROM mart_listening_history AS listening
+            CROSS JOIN (
+                SELECT setting_value
+                FROM pipeline_settings
+                WHERE setting_name = 'analytics_timezone'
+            ) AS settings
+            CROSS JOIN LATERAL UNNEST(listening.artist_names) AS artist(artist_name)
+            WHERE (listening.played_at AT TIME ZONE settings.setting_value)::DATE
+                BETWEEN %s AND %s
+            """,
+            filter_params,
         )
         daily = query_dataframe(
-            """
-            SELECT played_date_local, play_count
-            FROM analytics_listening_by_day
+            f"""
+            SELECT
+                (played_at AT TIME ZONE settings.setting_value)::DATE AS played_date_local,
+                COUNT(*) AS play_count
+            {filtered_listening}
+            GROUP BY played_date_local
             ORDER BY played_date_local
-            """
+            """,
+            filter_params,
         )
         hourly = query_dataframe(
-            """
-            SELECT hour_local, play_count
-            FROM analytics_listening_by_hour
+            f"""
+            SELECT
+                EXTRACT(HOUR FROM played_at AT TIME ZONE settings.setting_value)::SMALLINT AS hour_local,
+                COUNT(*) AS play_count
+            {filtered_listening}
+            GROUP BY hour_local
             ORDER BY hour_local
-            """
+            """,
+            filter_params,
         )
         top_tracks = query_dataframe(
-            """
-            SELECT track_name, array_to_string(artist_names, ', ') AS artists, play_count
-            FROM analytics_top_tracks
+            f"""
+            SELECT track_name, array_to_string(artist_names, ', ') AS artists, COUNT(*) AS play_count
+            {filtered_listening}
+            GROUP BY track_name, artist_names
             ORDER BY play_count DESC, track_name
             LIMIT 10
-            """
+            """,
+            filter_params,
         )
         top_artists = query_dataframe(
-            """
-            SELECT artist_name, play_count, unique_tracks
-            FROM analytics_top_artists
-            ORDER BY play_count DESC, artist_name
+            f"""
+            SELECT
+                artist.artist_name,
+                COUNT(*) AS play_count,
+                COUNT(DISTINCT listening.track_id) AS unique_tracks
+            FROM mart_listening_history AS listening
+            CROSS JOIN (
+                SELECT setting_value
+                FROM pipeline_settings
+                WHERE setting_name = 'analytics_timezone'
+            ) AS settings
+            CROSS JOIN LATERAL UNNEST(listening.artist_names) AS artist(artist_name)
+            WHERE (listening.played_at AT TIME ZONE settings.setting_value)::DATE
+                BETWEEN %s AND %s
+            GROUP BY artist.artist_name
+            ORDER BY play_count DESC, artist.artist_name
             LIMIT 10
-            """
+            """,
+            filter_params,
         )
         top_genres = query_dataframe(
             """
-            SELECT genre, play_count
-            FROM analytics_top_genres
-            ORDER BY play_count DESC, genre
+            SELECT genre.genre, COUNT(DISTINCT listening.played_at) AS play_count
+            FROM raw_recently_played AS raw
+            JOIN mart_listening_history AS listening ON listening.played_at = raw.played_at
+            CROSS JOIN (
+                SELECT setting_value
+                FROM pipeline_settings
+                WHERE setting_name = 'analytics_timezone'
+            ) AS settings
+            CROSS JOIN LATERAL jsonb_array_elements(raw.payload->'track'->'artists') AS track_artist
+            JOIN artist_genres AS genre ON genre.artist_id = track_artist->>'id'
+            WHERE (listening.played_at AT TIME ZONE settings.setting_value)::DATE
+                BETWEEN %s AND %s
+            GROUP BY genre.genre
+            ORDER BY play_count DESC, genre.genre
             LIMIT 10
-            """
+            """,
+            filter_params,
         )
         recent = query_dataframe(
-            """
+            f"""
             SELECT
-                played_at AT TIME ZONE (
-                    SELECT setting_value FROM pipeline_settings
-                    WHERE setting_name = 'analytics_timezone'
-                ) AS played_at_local,
+                played_at AT TIME ZONE settings.setting_value AS played_at_local,
                 track_name,
                 array_to_string(artist_names, ', ') AS artists,
                 album_name
-            FROM mart_listening_history
+            {filtered_listening}
             ORDER BY played_at DESC
             LIMIT 20
-            """
+            """,
+            filter_params,
         )
     except (psycopg.Error, KeyError) as error:
         st.error(f"Не удалось загрузить данные: {error}")
@@ -97,7 +178,7 @@ def main() -> None:
         return
 
     if summary.empty or not summary.loc[0, "total_plays"]:
-        st.info("В аналитической таблице пока нет данных. Сначала запусти ingestion и transform.")
+        st.info("За выбранный период прослушиваний нет.")
         return
 
     metrics = summary.loc[0]
