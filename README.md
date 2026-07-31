@@ -161,7 +161,7 @@ The default database credentials are for local development only. Do not use them
 
 ## Dashboard
 
-The Streamlit dashboard visualizes listening activity by local day and hour, top tracks, top artists, top genres, and the latest listening events. Use the sidebar date-range selector to apply one local-date period to every metric and visualization.
+The Streamlit dashboard visualizes listening activity by local day and hour, top tracks, top artists, top genres, and the latest listening events. The latest-events table includes Last.fm tags and a human-readable local timestamp with weekday and month names. Use the sidebar date-range selector to apply one local-date period to every metric and visualization.
 
 Start the database and make sure the mart is current:
 

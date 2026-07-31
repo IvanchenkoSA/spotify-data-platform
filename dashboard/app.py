@@ -9,11 +9,45 @@ from ingestion.src.database import database_url
 
 st.set_page_config(page_title="Spotify listening dashboard", page_icon="🎧", layout="wide")
 
+WEEKDAY_NAMES = (
+    "понедельник",
+    "вторник",
+    "среда",
+    "четверг",
+    "пятница",
+    "суббота",
+    "воскресенье",
+)
+MONTH_NAMES = (
+    "января",
+    "февраля",
+    "марта",
+    "апреля",
+    "мая",
+    "июня",
+    "июля",
+    "августа",
+    "сентября",
+    "октября",
+    "ноября",
+    "декабря",
+)
+
 
 @st.cache_data(ttl=60)
 def query_dataframe(query: str, params: tuple = ()) -> pd.DataFrame:
     with psycopg.connect(database_url()) as connection:
         return pd.read_sql(query, connection, params=params)
+
+
+def format_local_datetime(value: object) -> str:
+    """Render a local timestamp with Russian weekday and month names."""
+    timestamp = pd.Timestamp(value)
+    return (
+        f"{WEEKDAY_NAMES[timestamp.weekday()]}, {timestamp.day} "
+        f"{MONTH_NAMES[timestamp.month - 1]} {timestamp.year} г., "
+        f"{timestamp:%H:%M}"
+    )
 
 
 def main() -> None:
@@ -165,7 +199,17 @@ def main() -> None:
                 played_at AT TIME ZONE settings.setting_value AS played_at_local,
                 track_name,
                 array_to_string(artist_names, ', ') AS artists,
-                album_name
+                album_name,
+                COALESCE(
+                    (
+                        SELECT string_agg(DISTINCT genre.genre, ', ' ORDER BY genre.genre)
+                        FROM raw_recently_played AS raw
+                        CROSS JOIN LATERAL jsonb_array_elements(raw.payload->'track'->'artists') AS track_artist
+                        JOIN artist_genres AS genre ON genre.artist_id = track_artist->>'id'
+                        WHERE raw.played_at = listening.played_at
+                    ),
+                    '—'
+                ) AS genres
             {filtered_listening}
             ORDER BY played_at DESC
             LIMIT 20
@@ -180,6 +224,17 @@ def main() -> None:
     if summary.empty or not summary.loc[0, "total_plays"]:
         st.info("За выбранный период прослушиваний нет.")
         return
+
+    recent["played_at_local"] = recent["played_at_local"].map(format_local_datetime)
+    recent = recent.rename(
+        columns={
+            "played_at_local": "Когда слушал",
+            "track_name": "Трек",
+            "artists": "Исполнитель",
+            "album_name": "Альбом",
+            "genres": "Жанровые теги",
+        }
+    )
 
     metrics = summary.loc[0]
     metric_one, metric_two, metric_three = st.columns(3)
