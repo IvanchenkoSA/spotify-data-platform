@@ -3,7 +3,7 @@
 A local ingestion pipeline for Spotify's recently played tracks.
 
 ```text
-Spotify API → raw ingestion → data/raw/*.json + raw_recently_played → transform → mart_listening_history
+Spotify API + Last.fm API → raw ingestion → data/raw/*.json + PostgreSQL raw tables → transform → mart_listening_history
 ```
 
 The pipeline keeps the full API response as raw JSON and loads each listening event into PostgreSQL. A watermark records the most recent event already processed, so later runs request only new listening history. The `played_at` primary key makes reruns idempotent.
@@ -27,6 +27,7 @@ SPOTIFY_CLIENT_ID=your_client_id
 SPOTIFY_CLIENT_SECRET=your_client_secret
 SPOTIFY_REDIRECT_URI=http://127.0.0.1:8888/callback
 LASTFM_API_KEY=your_lastfm_api_key
+LASTFM_USERNAME=your_lastfm_username
 ```
 
 Optionally set the analytics timezone explicitly. If it is omitted, the transform command uses the timezone configured on the machine where it runs.
@@ -69,6 +70,13 @@ ANALYTICS_TIMEZONE=Asia/Novosibirsk
    py -3.13 -B -m ingestion.src.enrich_artists
    ```
 
+6. Backfill Last.fm scrobbles. On the first run this requests every page in the
+   profile history; later runs fetch only scrobbles newer than the saved watermark.
+
+   ```powershell
+   py -3.13 -B -m ingestion.src.ingest_lastfm
+   ```
+
 ## What happens on each ingestion run
 
 1. Read the watermark from PostgreSQL.
@@ -78,6 +86,30 @@ ANALYTICS_TIMEZONE=Asia/Novosibirsk
 5. Advance the watermark in the same database transaction.
 
 The first run receives up to 50 recent events. Subsequent runs add only newly played tracks. Repeating the command without new listening activity inserts zero rows.
+
+## Last.fm history ingestion
+
+Connect Spotify to Last.fm in its account settings to enable scrobbling. The project reads the public Last.fm profile configured in `LASTFM_USERNAME`; it does not need a Last.fm password or session token. `ingest_lastfm` stores every completed scrobble in `raw_lastfm_scrobbles`, persists every response page under `data/raw/`, and uses a separate `lastfm_scrobbles` watermark. The watermark advances only after every requested page succeeds, while the stable event key makes its one-second overlap idempotent.
+
+Last.fm and Spotify events are intentionally kept separate in the raw layer: a Last.fm scrobble may omit a short skip, while Spotify can include it. A later staging model will reconcile the sources into a canonical listening-events mart without hiding their provenance.
+
+## Spotify Extended Streaming History import
+
+Request **Extended Streaming History** from Spotify's Account Privacy download tool. It is a personal-data ZIP archive, so keep it outside Git (for example, under `data/private/`). The importer reads either the ZIP directly, a single JSON file, or an extracted export directory. It supports current `endsong_*.json` files and legacy `Streaming_History_Audio_*.json` files.
+
+```powershell
+py -3.13 -B -m ingestion.src.import_spotify_history data/private/spotify-history.zip
+```
+
+The import stores music tracks only in `raw_spotify_extended_history`, preserving the original record JSON. Podcast-only entries are excluded from this music mart input. A stable event key makes reruns safe; the original ZIP is not copied or uploaded anywhere.
+
+## Pipeline observability
+
+Every Spotify, Last.fm, and privacy-export import creates a row in `pipeline_runs`. It records start and finish times, terminal status, extracted and inserted record counts, and an error message when a run fails. Inspect the latest runs locally:
+
+```powershell
+docker compose exec postgres psql -U spotify -d spotify -c "SELECT pipeline_name, status, extracted_count, inserted_count, started_at, finished_at FROM pipeline_runs ORDER BY run_id DESC LIMIT 20;"
+```
 
 ## Transform layer
 

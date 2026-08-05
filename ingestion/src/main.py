@@ -8,7 +8,14 @@ import requests
 from psycopg import Error as PsycopgError
 
 from .auth import CLIENT_ID, CLIENT_SECRET, TOKEN_FILE, TOKEN_URL, save_tokens
-from .database import connect, get_watermark, initialize_database, load_recently_played
+from .database import (
+    connect,
+    finish_pipeline_run,
+    get_watermark,
+    initialize_database,
+    load_recently_played,
+    start_pipeline_run,
+)
 
 
 RECENTLY_PLAYED_URL = "https://api.spotify.com/v1/me/player/recently-played"
@@ -69,9 +76,11 @@ def save_raw_response(payload: dict) -> Path:
 
 
 def main() -> None:
+    run_id: int | None = None
     try:
         with connect() as connection:
             initialize_database(connection)
+            run_id = start_pipeline_run(connection, "spotify_recently_played")
             watermark = get_watermark(connection)
             tokens = load_tokens()
             response = get_recently_played(tokens["access_token"], watermark)
@@ -84,8 +93,21 @@ def main() -> None:
             payload = response.json()
             output_file = save_raw_response(payload)
             loaded_count = load_recently_played(connection, payload)
+            finish_pipeline_run(
+                connection,
+                run_id,
+                "succeeded",
+                extracted_count=len(payload.get("items", [])),
+                inserted_count=loaded_count,
+            )
 
     except (FileNotFoundError, requests.RequestException, PsycopgError, RuntimeError) as error:
+        if run_id is not None:
+            try:
+                with connect() as connection:
+                    finish_pipeline_run(connection, run_id, "failed", error_message=str(error))
+            except PsycopgError:
+                pass
         raise SystemExit(f"Ingestion failed: {error}") from error
 
     print(f"Saved raw Spotify response to {output_file}")

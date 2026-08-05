@@ -1,7 +1,8 @@
-"""PostgreSQL storage for raw Spotify listening events."""
+"""PostgreSQL storage for raw Spotify and Last.fm listening events."""
 
+import hashlib
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 import psycopg
 from psycopg.types.json import Jsonb
@@ -9,6 +10,7 @@ from psycopg.types.json import Jsonb
 
 DEFAULT_DATABASE_URL = "postgresql://spotify:spotify@localhost:5433/spotify"
 WATERMARK_NAME = "recently_played"
+LASTFM_WATERMARK_NAME = "lastfm_scrobbles"
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS raw_recently_played (
@@ -18,11 +20,54 @@ CREATE TABLE IF NOT EXISTS raw_recently_played (
     ingested_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS raw_lastfm_scrobbles (
+    event_key TEXT PRIMARY KEY,
+    scrobbled_at TIMESTAMPTZ NOT NULL,
+    artist_name TEXT NOT NULL,
+    track_name TEXT NOT NULL,
+    album_name TEXT,
+    payload JSONB NOT NULL,
+    ingested_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS raw_lastfm_scrobbles_scrobbled_at_idx
+    ON raw_lastfm_scrobbles (scrobbled_at);
+
+CREATE TABLE IF NOT EXISTS raw_spotify_extended_history (
+    event_key TEXT PRIMARY KEY,
+    ended_at TIMESTAMPTZ NOT NULL,
+    track_uri TEXT,
+    track_name TEXT NOT NULL,
+    artist_name TEXT NOT NULL,
+    album_name TEXT,
+    ms_played INTEGER,
+    source_file TEXT NOT NULL,
+    payload JSONB NOT NULL,
+    ingested_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS raw_spotify_extended_history_ended_at_idx
+    ON raw_spotify_extended_history (ended_at);
+
 CREATE TABLE IF NOT EXISTS ingestion_watermarks (
     stream_name TEXT PRIMARY KEY,
     played_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS pipeline_runs (
+    run_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    pipeline_name TEXT NOT NULL,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    finished_at TIMESTAMPTZ,
+    status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed')),
+    extracted_count INTEGER,
+    inserted_count INTEGER,
+    error_message TEXT
+);
+
+CREATE INDEX IF NOT EXISTS pipeline_runs_name_started_at_idx
+    ON pipeline_runs (pipeline_name, started_at DESC);
 
 CREATE TABLE IF NOT EXISTS pipeline_settings (
     setting_name TEXT PRIMARY KEY,
@@ -156,14 +201,198 @@ def initialize_database(connection: psycopg.Connection) -> None:
     connection.commit()
 
 
-def get_watermark(connection: psycopg.Connection) -> datetime | None:
+def get_watermark(
+    connection: psycopg.Connection, stream_name: str = WATERMARK_NAME
+) -> datetime | None:
     with connection.cursor() as cursor:
         cursor.execute(
             "SELECT played_at FROM ingestion_watermarks WHERE stream_name = %s",
-            (WATERMARK_NAME,),
+            (stream_name,),
         )
         row = cursor.fetchone()
     return row[0] if row else None
+
+
+def set_watermark(
+    connection: psycopg.Connection, stream_name: str, played_at: datetime
+) -> None:
+    """Advance one stream's watermark without committing the transaction."""
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO ingestion_watermarks (stream_name, played_at)
+            VALUES (%s, %s)
+            ON CONFLICT (stream_name) DO UPDATE
+            SET played_at = EXCLUDED.played_at, updated_at = NOW()
+            WHERE ingestion_watermarks.played_at < EXCLUDED.played_at
+            """,
+            (stream_name, played_at),
+        )
+
+
+def start_pipeline_run(connection: psycopg.Connection, pipeline_name: str) -> int:
+    """Create an observable run record before external work begins."""
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO pipeline_runs (pipeline_name, status)
+            VALUES (%s, 'running')
+            RETURNING run_id
+            """,
+            (pipeline_name,),
+        )
+        run_id = cursor.fetchone()[0]
+    connection.commit()
+    return run_id
+
+
+def finish_pipeline_run(
+    connection: psycopg.Connection,
+    run_id: int,
+    status: str,
+    extracted_count: int | None = None,
+    inserted_count: int | None = None,
+    error_message: str | None = None,
+) -> None:
+    """Mark a run terminal and capture its observable outcome."""
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE pipeline_runs
+            SET finished_at = NOW(),
+                status = %s,
+                extracted_count = %s,
+                inserted_count = %s,
+                error_message = %s
+            WHERE run_id = %s
+            """,
+            (status, extracted_count, inserted_count, error_message, run_id),
+        )
+    connection.commit()
+
+
+def _lastfm_text(value: object) -> str:
+    """Extract a text value from Last.fm's object-or-string response fields."""
+    if isinstance(value, dict):
+        return str(value.get("#text", "")).strip()
+    return str(value or "").strip()
+
+
+def _lastfm_event_key(username: str, item: dict) -> str:
+    """Make a stable key because Last.fm timestamps have second precision."""
+    event_date = item.get("date", {})
+    timestamp = str(event_date.get("uts", "")) if isinstance(event_date, dict) else ""
+    identity = "\x1f".join(
+        (
+            username.casefold(),
+            timestamp,
+            _lastfm_text(item.get("artist")).casefold(),
+            str(item.get("name", "")).strip().casefold(),
+            _lastfm_text(item.get("album")).casefold(),
+            str(item.get("mbid", "")).strip(),
+        )
+    )
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def load_lastfm_scrobbles(
+    connection: psycopg.Connection, username: str, items: list[dict]
+) -> int:
+    """Store one Last.fm page idempotently without advancing its watermark."""
+    rows: list[tuple[str, datetime, str, str, str | None, Jsonb]] = []
+    for item in items:
+        event_date = item.get("date")
+        if not isinstance(event_date, dict) or not event_date.get("uts"):
+            # The current "now playing" item has no completed scrobble timestamp.
+            continue
+
+        artist_name = _lastfm_text(item.get("artist"))
+        track_name = str(item.get("name", "")).strip()
+        if not artist_name or not track_name:
+            continue
+
+        album_name = _lastfm_text(item.get("album")) or None
+        scrobbled_at = datetime.fromtimestamp(int(event_date["uts"]), tz=timezone.utc)
+        rows.append(
+            (
+                _lastfm_event_key(username, item),
+                scrobbled_at,
+                artist_name,
+                track_name,
+                album_name,
+                Jsonb(item),
+            )
+        )
+
+    inserted_count = 0
+    with connection.cursor() as cursor:
+        for row in rows:
+            cursor.execute(
+                """
+                INSERT INTO raw_lastfm_scrobbles (
+                    event_key, scrobbled_at, artist_name, track_name, album_name, payload
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (event_key) DO NOTHING
+                RETURNING event_key
+                """,
+                row,
+            )
+            inserted_count += int(cursor.fetchone() is not None)
+
+    connection.commit()
+    return inserted_count
+
+
+def load_spotify_extended_history(
+    connection: psycopg.Connection, source_file: str, events: list[dict]
+) -> int:
+    """Store normalized music events from one Spotify privacy-export file."""
+    rows: list[tuple[str, datetime, str | None, str, str, str | None, int | None, str, Jsonb]] = []
+    for event in events:
+        ended_at = event["ended_at"]
+        identity = "\x1f".join(
+            (
+                ended_at.isoformat(),
+                event.get("track_uri") or "",
+                event["track_name"].casefold(),
+                event["artist_name"].casefold(),
+                str(event.get("ms_played") or ""),
+            )
+        )
+        rows.append(
+            (
+                hashlib.sha256(identity.encode("utf-8")).hexdigest(),
+                ended_at,
+                event.get("track_uri"),
+                event["track_name"],
+                event["artist_name"],
+                event.get("album_name"),
+                event.get("ms_played"),
+                source_file,
+                Jsonb(event["payload"]),
+            )
+        )
+
+    inserted_count = 0
+    with connection.cursor() as cursor:
+        for row in rows:
+            cursor.execute(
+                """
+                INSERT INTO raw_spotify_extended_history (
+                    event_key, ended_at, track_uri, track_name, artist_name, album_name,
+                    ms_played, source_file, payload
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (event_key) DO NOTHING
+                RETURNING event_key
+                """,
+                row,
+            )
+            inserted_count += int(cursor.fetchone() is not None)
+
+    connection.commit()
+    return inserted_count
 
 
 def set_analytics_timezone(connection: psycopg.Connection, timezone_name: str) -> None:
